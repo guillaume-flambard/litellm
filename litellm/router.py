@@ -7725,6 +7725,46 @@ class Router:
             TaggedPreRoutingStrategy(tags=tags, strategy=strategy),
         ]
 
+    @staticmethod
+    def _unregister_pre_routing_strategy(
+        registry: dict[str, list[TaggedPreRoutingStrategy[_PreRoutingStrategyT]]],
+        model_name: str,
+        tags: tuple[str, ...],
+    ) -> None:
+        """Drop the strategy registered for this exact (model_name, tags) pair, leaving
+        strategies registered under the same name with different tags in place."""
+        remaining = [existing for existing in registry.get(model_name, []) if existing.tags != tags]
+        if remaining:
+            registry[model_name] = remaining
+        else:
+            registry.pop(model_name, None)
+
+    def _unregister_pre_routing_strategy_for_deployment(self, deployment: Deployment) -> None:
+        """
+        Release the pre-routing strategy a deployment holds, so removing it from the
+        model_list also frees its (model_name, tags) slot.
+
+        Without this, re-adding the deployment (an edit arriving via upsert_deployment,
+        or a router recreated under a name that was deleted earlier) hits the
+        "already exists" guard in `_register_pre_routing_strategy`, which
+        `ignore_invalid_deployments` swallows - the deployment then silently never
+        makes it back into the model_list.
+
+        Dispatches on the model prefix so removing a *regular* deployment can't evict a
+        router that merely shares its model_name.
+        """
+        litellm_params = deployment.litellm_params
+        model_name = deployment.model_name
+        tags = self._deployment_tags(deployment)
+        if self._is_auto_router_deployment(litellm_params=litellm_params):
+            self._unregister_pre_routing_strategy(self.auto_routers, model_name, tags)
+        elif self._is_complexity_router_deployment(litellm_params=litellm_params):
+            self._unregister_pre_routing_strategy(self.complexity_routers, model_name, tags)
+        elif self._is_adaptive_router_deployment(litellm_params=litellm_params):
+            self._unregister_pre_routing_strategy(self.adaptive_routers, model_name, tags)
+        elif self._is_quality_router_deployment(litellm_params=litellm_params):
+            self._unregister_pre_routing_strategy(self.quality_routers, model_name, tags)
+
     def _finalize_adaptive_router_if_configured(self) -> None:
         """Locate every adaptive-router deployment in the finalized model_list and
         build an AdaptiveRouter for each. Safe no-op when none are configured.
@@ -8392,13 +8432,27 @@ class Router:
                         self._invalidate_access_groups_cache()
                         self._update_deployment_indices_after_removal(model_id=deployment_id, removal_idx=removal_idx)
 
+                # Free the outgoing deployment's pre-routing strategy slot (keyed by the
+                # OLD model_name/tags) before the re-add below re-registers it.
+                self._unregister_pre_routing_strategy_for_deployment(deployment=_deployment_on_router)
+
             # if the model_id is not in router
             self.add_deployment(deployment=deployment)
+            # add_deployment() builds every strategy EXCEPT the adaptive one, which
+            # set_model_list() defers until the whole model_list is visible. Re-run that
+            # deferred pass so an adaptive router whose slot was just released above is
+            # rebuilt rather than left unregistered.
+            if self._is_adaptive_router_deployment(litellm_params=deployment.litellm_params) or (
+                _deployment_on_router is not None
+                and self._is_adaptive_router_deployment(litellm_params=_deployment_on_router.litellm_params)
+            ):
+                self._finalize_adaptive_router_if_configured()
             return deployment
         except Exception as e:
             if self.ignore_invalid_deployments:
-                verbose_router_logger.debug(
-                    f"Error upserting deployment: {e}, ignoring and continuing with other deployments."
+                verbose_router_logger.warning(
+                    f"Error upserting deployment {deployment.model_name} (id={deployment.model_info.id}): {e}. "
+                    "Dropping it and continuing with other deployments."
                 )
                 return None
             else:
@@ -8419,8 +8473,11 @@ class Router:
 
         try:
             if deployment_idx is not None:
+                deployment_to_remove = self.get_deployment(model_id=id)
                 # Pop the item from the list first
                 item = self.model_list.pop(deployment_idx)
+                if deployment_to_remove is not None:
+                    self._unregister_pre_routing_strategy_for_deployment(deployment=deployment_to_remove)
                 self._invalidate_model_group_info_cache()
                 self._invalidate_access_groups_cache()
                 self._update_deployment_indices_after_removal(model_id=id, removal_idx=deployment_idx)
