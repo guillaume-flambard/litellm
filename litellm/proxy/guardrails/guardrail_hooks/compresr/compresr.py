@@ -47,6 +47,10 @@ from litellm.llms.custom_httpx.http_handler import (
     httpxSpecialProvider,
 )
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.guardrails.guardrail_hooks.content_text import (
+    content_to_text,
+    replace_text_in_content,
+)
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.guardrails import GuardrailEventHooks, Mode
 from litellm.types.integrations.custom_logger import (
@@ -142,50 +146,6 @@ def _is_str_object_dict(value: object) -> TypeGuard[dict[str, object]]:  # guard
 
 def _is_object_list(value: object) -> TypeGuard[list[object]]:  # guard-ok: isinstance narrows correctly; predicate is trivially correct  # fmt: skip
     return isinstance(value, list)
-
-
-def _content_to_text(content: object) -> str:
-    """Collapse a message ``content`` (str or list-of-parts) to plain text.
-
-    For the multimodal list shape, joins ``{type: "text", text: ...}`` parts
-    with blank-line separators; non-text parts are ignored.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n\n".join(parts)
-    return ""
-
-
-def _replace_text_in_content(content: object, new_text: str) -> object:
-    """Write ``new_text`` back into a ``content`` value, preserving shape.
-
-    ``str`` content is replaced directly. For list-of-parts content the first
-    text part carries ``new_text``, later text parts are dropped, and
-    non-text parts (images, audio, files) pass through untouched.
-    """
-    if isinstance(content, str):
-        return new_text
-    if isinstance(content, list):
-        out: list[object] = []
-        replaced = False
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                if not replaced:
-                    out.append({**part, "text": new_text})
-                    replaced = True
-                continue
-            out.append(part)
-        if not replaced:
-            out.insert(0, {"type": "text", "text": new_text})
-        return out
-    return new_text
 
 
 def _render_tool_intent(fn: dict[str, object]) -> str:
@@ -422,7 +382,7 @@ def _assistant_text_from_response(response: object) -> str | None:
     if isinstance(choices, list) and choices:
         message = get_attribute_or_key(choices[0], "message", None)
         if message is not None:
-            text = _content_to_text(get_attribute_or_key(message, "content", None))
+            text = content_to_text(get_attribute_or_key(message, "content", None))
             if text:
                 return text
     content = get_attribute_or_key(response, "content", None)
@@ -905,7 +865,7 @@ class CompresrGuardrail(CustomGuardrail):
                     continue
             else:
                 continue
-            if len(_content_to_text(msg.get("content"))) < self.min_chars_to_compress:
+            if len(content_to_text(msg.get("content"))) < self.min_chars_to_compress:
                 continue
             targets.append(idx)
         return targets
@@ -916,7 +876,7 @@ class CompresrGuardrail(CustomGuardrail):
     ) -> tuple[str, int | None]:
         for idx in range(len(messages) - 1, -1, -1):
             if messages[idx].get("role") == "user":
-                return _content_to_text(messages[idx].get("content")), idx
+                return content_to_text(messages[idx].get("content")), idx
         return "", None
 
     def _apply_compression_results(
@@ -967,7 +927,7 @@ class CompresrGuardrail(CustomGuardrail):
             original_msg = out.compressed_messages[target_idx]
             out.compressed_messages[target_idx] = {
                 **original_msg,
-                "content": _replace_text_in_content(original_msg.get("content"), compressed_text),
+                "content": replace_text_in_content(original_msg.get("content"), compressed_text),
             }
             out.tokens_before += _safe_int(result.get("original_tokens"))
             out.tokens_after += _safe_int(result.get("compressed_tokens"))
@@ -1034,7 +994,7 @@ class CompresrGuardrail(CustomGuardrail):
             verbose_proxy_logger.debug("Compresr: no messages eligible for compression")
             return inputs
 
-        contexts = [_content_to_text(messages[idx].get("content")) for idx in targets]
+        contexts = [content_to_text(messages[idx].get("content")) for idx in targets]
 
         start_time = time.monotonic()
         results = await self._call_compress(contexts=contexts, queries=queries)
