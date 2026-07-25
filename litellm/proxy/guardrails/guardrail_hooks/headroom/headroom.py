@@ -28,10 +28,7 @@ from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,  # pyright: ignore[reportUnknownVariableType]
     httpxSpecialProvider,
 )
-from litellm.proxy.guardrails.guardrail_hooks.content_text import (
-    content_to_text,
-    replace_text_in_content,
-)
+from litellm.proxy.guardrails.guardrail_hooks.content_text import content_to_text
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.guardrails import GuardrailEventHooks, Mode
 from litellm.types.integrations.custom_logger import AgenticLoopPlan, AgenticLoopRequestPatch
@@ -55,24 +52,53 @@ def _is_object_list(value: object) -> TypeGuard[list[object]]:  # guard-ok: isin
     return isinstance(value, list)
 
 
+def _is_all_text_parts(content: object) -> bool:
+    if not isinstance(content, list) or not content:
+        return False
+    return all(isinstance(part, dict) and part.get("type") == "text" for part in content)
+
+
 def _flatten_messages_for_compression(messages: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Collapse text-bearing list-of-parts content to plain strings for /v1/compress.
+    """Collapse all-text list-of-parts content to plain strings for /v1/compress.
 
     The compression service's transforms only rewrite string content and skip
     the OpenAI list-of-parts shape, which is what every Anthropic-format
-    request translates to. Rows whose part list carries no text (e.g. a lone
-    image) are sent unchanged; the service passes them through.
+    request translates to. Only rows whose parts are ALL text are flattened:
+    cache_control breakpoints are positional (each caches the prefix ending
+    at its part), so merging text across a non-text part would move a later
+    breakpoint to the other side of it. Rows with non-text parts are sent
+    unchanged and pass through the service untouched.
     """
     flattened: list[dict[str, object]] = []
     for msg in messages:
         content = msg.get("content")
-        if isinstance(content, list):
+        if _is_all_text_parts(content):
             text = content_to_text(content)
             if text:
                 flattened.append({**msg, "content": text})
                 continue
         flattened.append(msg)
     return flattened
+
+
+def _merge_rewritten_text_parts(parts: list[object], new_text: str) -> list[object]:
+    """Collapse a rewritten all-text part list into one part carrying ``new_text``.
+
+    Only all-text rows are ever flattened, so the merged part IS the whole
+    row: it keeps the first part's fields and the LAST declared cache_control
+    breakpoint. An Anthropic breakpoint caches the prefix ending at its part,
+    so after the merge the last one (and its TTL) is the one that still
+    describes the row.
+    """
+    merged: dict[str, object] = {"type": "text", "text": new_text}
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+        if index == 0:
+            merged = {**part, "text": new_text}
+        if part.get("cache_control") is not None:
+            merged["cache_control"] = part["cache_control"]
+    return [merged]
 
 
 def _restore_content_shapes(
@@ -100,7 +126,7 @@ def _restore_content_shapes(
                 # per-part fields like cache_control on later text parts.
                 restored.append({**ret, "content": orig_content})
             else:
-                restored.append({**ret, "content": replace_text_in_content(orig_content, ret_content)})
+                restored.append({**ret, "content": _merge_rewritten_text_parts(orig_content, ret_content)})
         else:
             restored.append(ret)
     return restored

@@ -47,10 +47,7 @@ from litellm.llms.custom_httpx.http_handler import (
     httpxSpecialProvider,
 )
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.guardrails.guardrail_hooks.content_text import (
-    content_to_text,
-    replace_text_in_content,
-)
+from litellm.proxy.guardrails.guardrail_hooks.content_text import content_to_text
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.guardrails import GuardrailEventHooks, Mode
 from litellm.types.integrations.custom_logger import (
@@ -146,6 +143,31 @@ def _is_str_object_dict(value: object) -> TypeGuard[dict[str, object]]:  # guard
 
 def _is_object_list(value: object) -> TypeGuard[list[object]]:  # guard-ok: isinstance narrows correctly; predicate is trivially correct  # fmt: skip
     return isinstance(value, list)
+
+
+def _replace_text_in_content(content: object, new_text: str) -> object:
+    """Write ``new_text`` back into a ``content`` value, preserving shape.
+
+    ``str`` content is replaced directly. For list-of-parts content the first
+    text part carries ``new_text``, later text parts are dropped, and
+    non-text parts (images, audio, files) pass through untouched.
+    """
+    if isinstance(content, str):
+        return new_text
+    if isinstance(content, list):
+        out: list[object] = []
+        replaced = False
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                if not replaced:
+                    out.append({**part, "text": new_text})
+                    replaced = True
+                continue
+            out.append(part)
+        if not replaced:
+            out.insert(0, {"type": "text", "text": new_text})
+        return out
+    return new_text
 
 
 def _render_tool_intent(fn: dict[str, object]) -> str:
@@ -927,7 +949,7 @@ class CompresrGuardrail(CustomGuardrail):
             original_msg = out.compressed_messages[target_idx]
             out.compressed_messages[target_idx] = {
                 **original_msg,
-                "content": replace_text_in_content(original_msg.get("content"), compressed_text),
+                "content": _replace_text_in_content(original_msg.get("content"), compressed_text),
             }
             out.tokens_before += _safe_int(result.get("original_tokens"))
             out.tokens_after += _safe_int(result.get("compressed_tokens"))
