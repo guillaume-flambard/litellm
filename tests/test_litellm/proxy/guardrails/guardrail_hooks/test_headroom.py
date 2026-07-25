@@ -1768,3 +1768,56 @@ async def test_fail_open_returns_original_parts_shapes():
 
     messages = result["structured_messages"]
     assert [m["content"] for m in messages] == [m["content"] for m in PARTS_MESSAGES]
+
+
+@pytest.mark.asyncio
+async def test_rewritten_row_keeps_last_cache_control_breakpoint(
+    guardrail: HeadroomGuardrail,
+):
+    """A rewritten multi-text-part row keeps the LAST part's cache_control.
+
+    An Anthropic breakpoint caches the prefix ending at its part, so once the
+    text parts merge, the last breakpoint (and its TTL) is the one that still
+    describes the row.
+    """
+    multi_part = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "First block. " + "E" * 2000, "cache_control": {"type": "ephemeral"}},
+                {
+                    "type": "text",
+                    "text": "Second block.",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+            ],
+        },
+    ]
+    inputs = GenericGuardrailAPIInputs(
+        texts=["E" * 2000],
+        structured_messages=json.loads(json.dumps(multi_part)),
+    )
+    mock_response = _make_compress_response(
+        [{"role": "system", "content": "compressed system summary"}]
+    )
+
+    with patch.object(
+        guardrail.async_handler,
+        "post",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ):
+        result = await guardrail.apply_guardrail(
+            inputs=inputs,
+            request_data={"model": "claude-fable-5"},
+            input_type="request",
+        )
+
+    content = result["structured_messages"][0]["content"]
+    assert isinstance(content, list)
+    text_parts = [p for p in content if p.get("type") == "text"]
+    assert len(text_parts) == 1
+    assert text_parts[0]["text"] == "compressed system summary"
+    assert text_parts[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert content[-1] == multi_part[0]["content"][2]

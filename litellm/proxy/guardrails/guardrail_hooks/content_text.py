@@ -32,23 +32,32 @@ def content_to_text(content: object) -> str:
 def replace_text_in_content(content: object, new_text: str) -> object:
     """Write ``new_text`` back into a ``content`` value, preserving shape.
 
-    ``str`` content is replaced directly. For list-of-parts content the first
-    text part carries ``new_text``, later text parts are dropped, and
-    non-text parts (images, audio, files) pass through untouched.
+    ``str`` content is replaced directly. For list-of-parts content the text
+    parts collapse into the first one, which carries ``new_text``, and
+    non-text parts (images, audio, files) pass through untouched. The merged
+    part keeps the ``cache_control`` of the LAST text part that had one: an
+    Anthropic breakpoint caches the prefix ending at its part, so after the
+    parts merge, the last breakpoint (and its TTL) is the one that still
+    describes the row.
     """
     if isinstance(content, str):
         return new_text
     if isinstance(content, list):
         out: list[object] = []
-        replaced = False
+        merged: dict[str, object] | None = None
+        last_cache_control: object = None
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
-                if not replaced:
-                    out.append({**part, "text": new_text})
-                    replaced = True
+                if part.get("cache_control") is not None:
+                    last_cache_control = part["cache_control"]
+                if merged is None:
+                    merged = {**part, "text": new_text}
+                    out.append(merged)
                 continue
             out.append(part)
-        if not replaced:
+        if merged is None:
             out.insert(0, {"type": "text", "text": new_text})
+        elif last_cache_control is not None:
+            merged["cache_control"] = last_cache_control
         return out
     return new_text
