@@ -2,10 +2,13 @@
 Per-Session Budget Limiter for LiteLLM Proxy.
 
 Enforces a dollar-amount cap per session (identified by `session_id` /
-`x-litellm-trace-id`). After each successful LLM call the response cost is
-accumulated against the session. When the accumulated spend exceeds
-`max_budget_per_session` (configured in agent litellm_params), subsequent
-requests for that session receive a 429.
+`x-litellm-trace-id`). Admission atomically reserves the request's estimated
+worst-case cost against the session counter, so concurrent requests for the
+same session cannot all read the same below-budget value and pass. The
+reservation is reconciled to the actual response cost once the call finishes.
+When the spend accumulated before a request (committed spend plus in-flight
+reservations) reaches `max_budget_per_session` (configured in agent
+litellm_params), that request receives a 429.
 
 Note: trace-id enforcement (require_trace_id_on_calls_by_agent) is handled
 separately in auth_checks.py at the agent level, not in this hook.
@@ -52,6 +55,16 @@ return new_val
 
 # Default TTL for session budget counters (1 hour)
 DEFAULT_MAX_BUDGET_PER_SESSION_TTL = 3600
+
+RESERVED_COST_KEY = "litellm_session_budget_reserved_cost"
+RESERVED_SESSION_ID_KEY = "litellm_session_budget_reserved_session_id"
+RESERVATION_RELEASED_KEY = "litellm_session_budget_reservation_released"
+
+_METADATA_CHANNELS = ("metadata", "litellm_metadata")
+
+
+def _to_float(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 class _PROXY_MaxBudgetPerSessionHandler(CustomLogger):
@@ -101,21 +114,29 @@ class _PROXY_MaxBudgetPerSessionHandler(CustomLogger):
 
         max_budget = float(max_budget)
         cache_key = self._make_cache_key(session_id)
-        current_spend = await self._get_current_spend(cache_key)
+        reserved_cost = self._estimate_request_cost(data=data, user_api_key_dict=user_api_key_dict)
+
+        if reserved_cost is None:
+            spend_before = await self._get_current_spend(cache_key)
+        else:
+            spend_before = await self._increment_spend(cache_key, reserved_cost) - reserved_cost
 
         verbose_proxy_logger.debug(
-            "MaxBudgetPerSessionHandler: session_id=%s, spend=%.4f, max=%.2f",
+            "MaxBudgetPerSessionHandler: session_id=%s, spend=%.4f, reserved=%s, max=%.2f",
             session_id,
-            current_spend,
+            spend_before,
+            reserved_cost,
             max_budget,
         )
 
-        if current_spend >= max_budget:
+        if spend_before >= max_budget:
+            if reserved_cost is not None:
+                await self._increment_spend(cache_key, -reserved_cost)
             resolved_model, llm_provider = resolve_llm_provider_for_rate_limit(data.get("model") if data else None)
             raise ProxyRateLimitError(
                 detail=(
                     f"Session budget exceeded for session {session_id}. "
-                    f"Current spend: ${current_spend:.4f}, "
+                    f"Current spend: ${spend_before:.4f}, "
                     f"max_budget_per_session: ${max_budget:.2f}."
                 ),
                 rate_limit_type=RateLimitType.BUDGET,
@@ -123,13 +144,20 @@ class _PROXY_MaxBudgetPerSessionHandler(CustomLogger):
                 llm_provider=llm_provider,
             )
 
+        if reserved_cost is not None:
+            self._stash_reservation(data=data, session_id=session_id, reserved_cost=reserved_cost)
+
         return None
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         """
-        After a successful LLM call, increment the session spend by the response cost.
+        After a successful LLM call, settle the session spend against the response cost.
         """
         try:
+            response_cost = _to_float(kwargs.get("response_cost"))
+            if await self._reconcile_reservation(data=kwargs, actual_cost=response_cost):
+                return
+
             litellm_params = kwargs.get("litellm_params") or {}
             metadata = litellm_params.get("metadata") or {}
             session_id = metadata.get("session_id")
@@ -153,12 +181,11 @@ class _PROXY_MaxBudgetPerSessionHandler(CustomLogger):
             if max_budget is None:
                 return
 
-            response_cost = kwargs.get("response_cost") or 0.0
             if response_cost <= 0:
                 return
 
             cache_key = self._make_cache_key(str(session_id))
-            await self._increment_spend(cache_key, float(response_cost))
+            await self._increment_spend(cache_key, response_cost)
 
             verbose_proxy_logger.debug(
                 "MaxBudgetPerSessionHandler: incremented session %s spend by %.6f",
@@ -170,6 +197,127 @@ class _PROXY_MaxBudgetPerSessionHandler(CustomLogger):
                 "MaxBudgetPerSessionHandler: error in async_log_success_event: %s",
                 str(e),
             )
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        """
+        Release the admission reservation when the LLM call fails.
+        """
+        await self._reconcile_reservation(data=kwargs, actual_cost=_to_float(kwargs.get("response_cost")))
+
+    async def async_post_call_failure_hook(
+        self,
+        request_data: dict,
+        original_exception: Exception,
+        user_api_key_dict: UserAPIKeyAuth,
+        traceback_str: str | None = None,
+    ) -> None:
+        """
+        Release the admission reservation when the request fails before or
+        during the LLM call (proxy-level rejection, provider error, timeout).
+        """
+        await self._reconcile_reservation(data=request_data, actual_cost=0.0)
+
+    def _estimate_request_cost(self, data: dict, user_api_key_dict: UserAPIKeyAuth) -> float | None:
+        """
+        Worst-case cost of this request, used as the admission reservation.
+
+        Returns None when the model has no token pricing to estimate from; the
+        caller then falls back to read-only enforcement of committed spend.
+        """
+        from litellm.proxy.proxy_server import llm_router
+        from litellm.proxy.spend_tracking.budget_reservation import (
+            estimate_request_max_cost,
+        )
+
+        estimated_cost = estimate_request_max_cost(
+            request_body=data,
+            route=user_api_key_dict.request_route or "",
+            llm_router=llm_router,
+        )
+        if estimated_cost is None or estimated_cost <= 0:
+            return None
+        return float(estimated_cost)
+
+    @staticmethod
+    def _stash_reservation(data: dict, session_id: str, reserved_cost: float) -> None:
+        """
+        Record the reservation on every metadata channel a later callback can
+        read it from. ``data["metadata"]`` and ``kwargs["litellm_params"]["metadata"]``
+        are the same dict by the time logging callbacks fire, so writes here reach
+        both the success and the failure path.
+        """
+        channel_dicts = tuple(
+            channel_dict for channel in _METADATA_CHANNELS if isinstance((channel_dict := data.get(channel)), dict)
+        )
+        if not channel_dicts:
+            data["metadata"] = {}
+            channel_dicts = (data["metadata"],)
+        for channel_dict in channel_dicts:
+            channel_dict[RESERVED_COST_KEY] = reserved_cost
+            channel_dict[RESERVED_SESSION_ID_KEY] = session_id
+
+    @staticmethod
+    def _metadata_dicts(data: Any) -> tuple[dict[str, Any], ...]:
+        if not isinstance(data, dict):
+            return ()
+        litellm_params = data.get("litellm_params")
+        standard_logging_object = data.get("standard_logging_object")
+        candidates = (
+            *(data.get(channel) for channel in _METADATA_CHANNELS),
+            *(
+                (litellm_params.get(channel) for channel in _METADATA_CHANNELS)
+                if isinstance(litellm_params, dict)
+                else ()
+            ),
+            standard_logging_object.get("metadata") if isinstance(standard_logging_object, dict) else None,
+        )
+        return tuple(candidate for candidate in candidates if isinstance(candidate, dict))
+
+    @classmethod
+    def _get_reservation(cls, data: Any) -> tuple[str, float] | None:
+        """``(session_id, reserved_cost)`` for an unreleased reservation, else None."""
+        metadata_dicts = cls._metadata_dicts(data)
+        if any(metadata.get(RESERVATION_RELEASED_KEY) for metadata in metadata_dicts):
+            return None
+        for metadata in metadata_dicts:
+            session_id = metadata.get(RESERVED_SESSION_ID_KEY)
+            reserved_cost = metadata.get(RESERVED_COST_KEY)
+            if isinstance(session_id, str) and isinstance(reserved_cost, (int, float)):
+                return session_id, float(reserved_cost)
+        return None
+
+    @classmethod
+    def _mark_reservation_released(cls, data: Any) -> None:
+        for metadata in cls._metadata_dicts(data):
+            metadata[RESERVATION_RELEASED_KEY] = True
+
+    async def _reconcile_reservation(self, data: Any, actual_cost: float) -> bool:
+        """
+        Settle this request's admission reservation to its actual cost.
+
+        Returns False when the request never reserved (no estimate was
+        available), so the caller can fall back to plain post-hoc accounting.
+        Releasing is idempotent: the first caller marks the reservation
+        released, so sibling callbacks for the same request no-op.
+        """
+        reservation = self._get_reservation(data)
+        if reservation is None:
+            return False
+
+        session_id, reserved_cost = reservation
+        self._mark_reservation_released(data)
+
+        delta = actual_cost - reserved_cost
+        if delta != 0:
+            await self._increment_spend(self._make_cache_key(session_id), delta)
+
+        verbose_proxy_logger.debug(
+            "MaxBudgetPerSessionHandler: reconciled session %s reservation %.6f to actual %.6f",
+            session_id,
+            reserved_cost,
+            actual_cost,
+        )
+        return True
 
     def _get_session_id(self, data: dict) -> Optional[str]:
         """Extract session_id from request metadata."""
